@@ -47,6 +47,30 @@ static uint8_t *localCounterTable;
 // Choice states 0/1 select global; states 2/3 select local.
 static uint8_t *choiceTable;
 
+// Custom: PC-indexed perceptrons with 30 global-history inputs and a bias.
+// Storage used by Custom (other predictor tables are not allocated):
+//   customWeights: 256 * 31 * 8 = 63,488 bits (signed, saturating weights).
+//   customHistory: 32 bits, of which the low 30 contain branch history.
+//   customScore: 32 bits, retained between prediction and training.
+// Total: 63,552 bits, below the 65,792-bit limit.
+// Dimensions, masks and threshold are constants, not stored adaptive state.
+#define CUSTOM_ENTRIES 256
+#define CUSTOM_HISTORY_BITS 30
+#define CUSTOM_THRESHOLD 72
+#define CUSTOM_HISTORY_MASK UINT32_C(0x3fffffff)
+static int8_t customWeights[CUSTOM_ENTRIES][CUSTOM_HISTORY_BITS + 1];
+static uint32_t customHistory;
+static int32_t customScore;
+
+static void
+adjust_weight(int8_t *weight, int delta)
+{
+  if ((delta > 0 && *weight < INT8_MAX) ||
+      (delta < 0 && *weight > INT8_MIN)) {
+    *weight = (int8_t)(*weight + delta);
+  }
+}
+
 static void
 update_counter(uint8_t *counter, uint8_t outcome)
 {
@@ -69,7 +93,16 @@ update_counter(uint8_t *counter, uint8_t outcome)
 void
 init_predictor()
 {
-  if (bpType == GSHARE) {
+  if (bpType == CUSTOM) {
+    customHistory = 0;
+    customScore = 0;
+    for (unsigned int row = 0; row < CUSTOM_ENTRIES; ++row) {
+      customWeights[row][0] = -1; // Initially prefer NOTTAKEN.
+      for (unsigned int i = 1; i <= CUSTOM_HISTORY_BITS; ++i) {
+        customWeights[row][i] = 0;
+      }
+    }
+  } else if (bpType == GSHARE) {
     // Validate the shift width before computing the table size.
     if (ghistoryBits < 0 || ghistoryBits >= 32) {
       fprintf(stderr, "Gshare history bits must be between 0 and 31.\n");
@@ -155,7 +188,15 @@ make_prediction(uint32_t pc)
                         : counterTable[globalHistory];
       return counter >= WT ? TAKEN : NOTTAKEN;
     }
-    case CUSTOM:
+    case CUSTOM: {
+      const int8_t *weights = customWeights[pc & (CUSTOM_ENTRIES - 1)];
+      customScore = weights[0];
+      for (unsigned int i = 0; i < CUSTOM_HISTORY_BITS; ++i) {
+        customScore += (customHistory & (UINT32_C(1) << i))
+                       ? weights[i + 1] : -weights[i + 1];
+      }
+      return customScore >= 0 ? TAKEN : NOTTAKEN;
+    }
     default:
       break;
   }
@@ -171,7 +212,20 @@ make_prediction(uint32_t pc)
 void
 train_predictor(uint32_t pc, uint8_t outcome)
 {
-  if (bpType == GSHARE) {
+  if (bpType == CUSTOM) {
+    // Train with the same history and score used by make_prediction.
+    int target = outcome == TAKEN ? 1 : -1;
+    if ((customScore >= 0) != (outcome == TAKEN) ||
+        (customScore >= -CUSTOM_THRESHOLD && customScore <= CUSTOM_THRESHOLD)) {
+      int8_t *weights = customWeights[pc & (CUSTOM_ENTRIES - 1)];
+      adjust_weight(&weights[0], target);
+      for (unsigned int i = 0; i < CUSTOM_HISTORY_BITS; ++i) {
+        int input = (customHistory & (UINT32_C(1) << i)) ? 1 : -1;
+        adjust_weight(&weights[i + 1], target * input);
+      }
+    }
+    customHistory = ((customHistory << 1) | outcome) & CUSTOM_HISTORY_MASK;
+  } else if (bpType == GSHARE) {
     // Train the entry selected by the history used for prediction.
     uint32_t index = (pc ^ globalHistory) & historyMask;
     if (outcome == TAKEN) {
