@@ -40,6 +40,25 @@ uint32_t globalHistory;   // Store the most recent branch outcomes.
 uint32_t historyMask;     // Keep only the low ghistoryBits bits.
 uint8_t *counterTable;    // Store one 2-bit saturating counter per entry.
 
+static uint32_t localHistoryMask;
+static uint32_t pcIndexMask;
+static uint32_t *localHistoryTable;
+static uint8_t *localCounterTable;
+// Choice states 0/1 select global; states 2/3 select local.
+static uint8_t *choiceTable;
+
+static void
+update_counter(uint8_t *counter, uint8_t outcome)
+{
+  if (outcome == TAKEN) {
+    if (*counter < ST) {
+      ++*counter;
+    }
+  } else if (*counter > SN) {
+    --*counter;
+  }
+}
+
 
 //------------------------------------//
 //        Predictor Functions         //
@@ -70,6 +89,43 @@ init_predictor()
     for (uint32_t i = 0; i < tableSize; ++i) {
       counterTable[i] = WN;
     }
+  } else if (bpType == TOURNAMENT) {
+    if (ghistoryBits < 0 || ghistoryBits >= 32 ||
+        lhistoryBits < 0 || lhistoryBits >= 32 ||
+        pcIndexBits < 0 || pcIndexBits >= 32) {
+      fprintf(stderr, "Tournament history and index bits must be between 0 and 31.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    uint32_t globalSize = UINT32_C(1) << ghistoryBits;
+    uint32_t localSize = UINT32_C(1) << lhistoryBits;
+    uint32_t pcSize = UINT32_C(1) << pcIndexBits;
+    historyMask = globalSize - 1;
+    localHistoryMask = localSize - 1;
+    pcIndexMask = pcSize - 1;
+    globalHistory = 0;
+
+    counterTable = malloc((size_t)globalSize * sizeof(*counterTable));
+    choiceTable = malloc((size_t)globalSize * sizeof(*choiceTable));
+    localCounterTable = malloc((size_t)localSize * sizeof(*localCounterTable));
+    localHistoryTable = calloc((size_t)pcSize, sizeof(*localHistoryTable));
+    if (counterTable == NULL || choiceTable == NULL ||
+        localCounterTable == NULL || localHistoryTable == NULL) {
+      free(counterTable);
+      free(choiceTable);
+      free(localCounterTable);
+      free(localHistoryTable);
+      fprintf(stderr, "Unable to allocate the Tournament predictor tables.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    for (uint32_t i = 0; i < globalSize; ++i) {
+      counterTable[i] = WN;
+      choiceTable[i] = WN; // Weakly select the global predictor.
+    }
+    for (uint32_t i = 0; i < localSize; ++i) {
+      localCounterTable[i] = WN;
+    }
   }
 }
 
@@ -92,7 +148,13 @@ make_prediction(uint32_t pc)
       uint32_t index = (pc ^ globalHistory) & historyMask;
       return counterTable[index] >= WT ? TAKEN : NOTTAKEN;
     }
-    case TOURNAMENT:
+    case TOURNAMENT: {
+      uint32_t localHistory = localHistoryTable[pc & pcIndexMask];
+      uint8_t counter = choiceTable[globalHistory] >= WT
+                        ? localCounterTable[localHistory]
+                        : counterTable[globalHistory];
+      return counter >= WT ? TAKEN : NOTTAKEN;
+    }
     case CUSTOM:
     default:
       break;
@@ -123,6 +185,22 @@ train_predictor(uint32_t pc, uint8_t outcome)
     }
 
     // Shift the actual outcome into the least significant bit.
+    globalHistory = ((globalHistory << 1) | outcome) & historyMask;
+  } else if (bpType == TOURNAMENT) {
+    uint32_t pcIndex = pc & pcIndexMask;
+    uint32_t localHistory = localHistoryTable[pcIndex];
+    uint8_t globalPrediction = counterTable[globalHistory] >= WT;
+    uint8_t localPrediction = localCounterTable[localHistory] >= WT;
+
+    // Train the chooser only when one of the two predictors is correct.
+    // Use both predictions from before any counters or histories change.
+    if (globalPrediction != localPrediction) {
+      update_counter(&choiceTable[globalHistory], localPrediction == outcome);
+    }
+    update_counter(&counterTable[globalHistory], outcome);
+    update_counter(&localCounterTable[localHistory], outcome);
+
+    localHistoryTable[pcIndex] = ((localHistory << 1) | outcome) & localHistoryMask;
     globalHistory = ((globalHistory << 1) | outcome) & historyMask;
   }
 }
