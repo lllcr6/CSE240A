@@ -36,6 +36,9 @@ int verbose;
 //
 //TODO: Add your own Branch Predictor data structures here
 //
+uint32_t globalHistory;   // Store the most recent branch outcomes.
+uint32_t historyMask;     // Keep only the low ghistoryBits bits.
+uint8_t *counterTable;    // Store one 2-bit saturating counter per entry.
 
 
 //------------------------------------//
@@ -47,9 +50,27 @@ int verbose;
 void
 init_predictor()
 {
-  //
-  //TODO: Initialize Branch Predictor Data Structures
-  //
+  if (bpType == GSHARE) {
+    // Validate the shift width before computing the table size.
+    if (ghistoryBits < 0 || ghistoryBits >= 32) {
+      fprintf(stderr, "Gshare history bits must be between 0 and 31.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    uint32_t tableSize = UINT32_C(1) << ghistoryBits;
+    historyMask = tableSize - 1;
+    globalHistory = 0;
+    counterTable = malloc((size_t)tableSize * sizeof(*counterTable));
+    if (counterTable == NULL) {
+      fprintf(stderr, "Unable to allocate the Gshare counter table.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    // Start with not-taken history and weakly not-taken counters.
+    for (uint32_t i = 0; i < tableSize; ++i) {
+      counterTable[i] = WN;
+    }
+  }
 }
 
 // Make a prediction for conditional branch instruction at PC 'pc'
@@ -67,7 +88,10 @@ make_prediction(uint32_t pc)
   switch (bpType) {
     case STATIC:
       return TAKEN;
-    case GSHARE:
+    case GSHARE: {
+      uint32_t index = (pc ^ globalHistory) & historyMask;
+      return counterTable[index] >= WT ? TAKEN : NOTTAKEN;
+    }
     case TOURNAMENT:
     case CUSTOM:
     default:
@@ -85,7 +109,20 @@ make_prediction(uint32_t pc)
 void
 train_predictor(uint32_t pc, uint8_t outcome)
 {
-  //
-  //TODO: Implement Predictor training
-  //
+  if (bpType == GSHARE) {
+    // Train the entry selected by the history used for prediction.
+    uint32_t index = (pc ^ globalHistory) & historyMask;
+    if (outcome == TAKEN) {
+      if (counterTable[index] < ST) {
+        ++counterTable[index];
+      }
+    } else {
+      if (counterTable[index] > SN) {
+        --counterTable[index];
+      }
+    }
+
+    // Shift the actual outcome into the least significant bit.
+    globalHistory = ((globalHistory << 1) | outcome) & historyMask;
+  }
 }
